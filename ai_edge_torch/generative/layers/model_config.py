@@ -98,6 +98,19 @@ class KVCacheUpdateStrategy(enum.Enum):
 
 
 @dataclasses.dataclass
+class AltUpConfig:
+  num_inputs: int
+  active_idx: int
+  coef_clip: Optional[float] = None
+  correct_scale: bool = False
+
+
+@dataclasses.dataclass
+class LaurelConfig:
+  rank: int
+
+
+@dataclasses.dataclass
 class AttentionConfig:
   """Attention model's parameters."""
 
@@ -206,6 +219,13 @@ class TransformerBlockConfig:
   # across blocks
   kv_cache_max_len: Optional[int] = None
 
+  # Configuration for AltUp (Alternating Updates)
+  altup_config: Optional[AltUpConfig] = None
+  # Configuration for Laurel (Learned Augmented Residual Layer)
+  laurel_config: Optional[LaurelConfig] = None
+  # Hidden size for per-layer input projections (Gemma3n)
+  hidden_size_per_layer_input: Optional[int] = None
+
 
 @dataclasses.dataclass
 class ImageEmbeddingConfig:
@@ -252,6 +272,9 @@ class ModelConfig:
   # Whether LLM's HEAD shares the weight of the embedding.
   lm_head_share_weight_with_embedding: bool = True
   dense_intermediate_size: Optional[int] = None
+
+  # Vocab size for per-layer inputs (Gemma3n)
+  vocab_size_per_layer_input: Optional[int] = None
 
   # Whether to turn on high-level function boundary.
   enable_hlfb: bool = True
