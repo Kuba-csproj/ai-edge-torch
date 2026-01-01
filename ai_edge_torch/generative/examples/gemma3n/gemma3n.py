@@ -73,32 +73,47 @@ def load_gemma3n_weights(model: nn.Module, checkpoint_path: str):
   This function handles the complete weight loading for Gemma3n, including
   standard transformer weights and custom Gemma3n-specific weights (AltUp,
   Laurel, PerLayer embeddings).
+
+  Supports both:
+  - Direct text model format: model.embed_tokens, model.layers.{i}
+  - Multimodal format (HuggingFace): model.language_model.embed_tokens, etc.
   """
   # Load raw state dict
   state_dict = loading_utils.load_safetensors(checkpoint_path)
   if "model_state_dict" in state_dict:
     state_dict = state_dict["model_state_dict"]
 
+  # Auto-detect checkpoint format: check for multimodal prefix
+  if "model.language_model.embed_tokens.weight" in state_dict:
+    prefix = "model.language_model"
+  elif "model.embed_tokens.weight" in state_dict:
+    prefix = "model"
+  else:
+    raise KeyError(
+        "Could not detect checkpoint format. Expected either "
+        "'model.embed_tokens.weight' or 'model.language_model.embed_tokens.weight'"
+    )
+
   converted_state = {}
 
   # === Global embeddings ===
-  converted_state["tok_embedding.weight"] = state_dict["model.embed_tokens.weight"]
-  converted_state["final_norm.weight"] = state_dict["model.norm.weight"]
+  converted_state["tok_embedding.weight"] = state_dict[f"{prefix}.embed_tokens.weight"]
+  converted_state["final_norm.weight"] = state_dict[f"{prefix}.norm.weight"]
 
   # Per-layer embeddings
-  converted_state["per_layer_embedding.embedding.weight"] = state_dict["model.embed_tokens_per_layer.weight"]
-  converted_state["per_layer_model_projection.weight"] = state_dict["model.per_layer_model_projection.weight"]
-  converted_state["per_layer_projection_norm.weight"] = state_dict["model.per_layer_projection_norm.weight"]
+  converted_state["per_layer_embedding.embedding.weight"] = state_dict[f"{prefix}.embed_tokens_per_layer.weight"]
+  converted_state["per_layer_model_projection.weight"] = state_dict[f"{prefix}.per_layer_model_projection.weight"]
+  converted_state["per_layer_projection_norm.weight"] = state_dict[f"{prefix}.per_layer_projection_norm.weight"]
 
   # Global AltUp projections
   for i in range(len(model.altup_projections)):
-    converted_state[f"altup_projections.{i}.weight"] = state_dict[f"model.altup_projections.{i}.weight"]
+    converted_state[f"altup_projections.{i}.weight"] = state_dict[f"{prefix}.altup_projections.{i}.weight"]
   for i in range(len(model.altup_unembed_projections)):
-    converted_state[f"altup_unembed_projections.{i}.weight"] = state_dict[f"model.altup_unembed_projections.{i}.weight"]
+    converted_state[f"altup_unembed_projections.{i}.weight"] = state_dict[f"{prefix}.altup_unembed_projections.{i}.weight"]
 
   # === Per-layer weights ===
   for i in range(model.config.num_layers):
-    src = f"model.layers.{i}"
+    src = f"{prefix}.layers.{i}"
     dst = f"transformer_blocks.{i}"
 
     # Norms (sibling to atten_func and ff)
