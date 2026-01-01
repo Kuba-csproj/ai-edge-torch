@@ -30,7 +30,7 @@ References:
 """
 
 import math
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from ai_edge_torch.generative.layers import attention
 from ai_edge_torch.generative.layers import builder
@@ -80,8 +80,8 @@ class RMSNorm(nn.Module):
       self.register_buffer("weight", torch.tensor(1.0), persistent=False)
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
-    output = x / torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-    return output * self.weight
+    output = x.float() / torch.sqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+    return (output * self.weight.float()).type_as(x)
 
 
 class LaurelBlock(nn.Module):
@@ -180,7 +180,7 @@ class AltUp(nn.Module):
     """
     modalities = self.compute_router_modalities(activated)
     innovation = activated - predictions[self.active_idx]
-    innovation = innovation.repeat(self.num_inputs, 1, 1, 1)
+    innovation = innovation.unsqueeze(0).expand(self.num_inputs, -1, -1, -1)
 
     all_coefs = self.correction_coefs(modalities) + 1.0
     all_coefs = all_coefs.permute(2, 0, 1).unsqueeze(-1)
@@ -258,6 +258,7 @@ class Gemma3nDecoderBlock(nn.Module):
     self.hidden_size = hidden_size
     self.per_layer_dim = per_layer_dim
     self.altup_active_idx = 0
+    self.altup_num_inputs = altup_num_inputs
 
     # Standard transformer components
     self.pre_atten_norm = builder.build_norm(
@@ -271,7 +272,26 @@ class Gemma3nDecoderBlock(nn.Module):
     self.post_atten_norm = builder.build_norm(
         model_config.embedding_dim, config.post_attention_norm_config
     )
-    self.ff = builder.build_ff(model_config.embedding_dim, config.ff_config)
+
+    # Pre/post feedforward norms (applied separately from ff layer)
+    self.pre_ff_norm = builder.build_norm(
+        model_config.embedding_dim, config.ff_config.pre_ff_norm_config
+    )
+    self.post_ff_norm = builder.build_norm(
+        model_config.embedding_dim, config.ff_config.post_ff_norm_config
+    )
+
+    # Build feedforward WITHOUT internal norms (we apply them separately)
+    ff_config_no_norms = cfg.FeedForwardConfig(
+        type=config.ff_config.type,
+        activation=config.ff_config.activation,
+        intermediate_size=config.ff_config.intermediate_size,
+        use_bias=config.ff_config.use_bias,
+        use_separate_gating=True,
+        pre_ff_norm_config=None,  # No internal norms
+        post_ff_norm_config=None,
+    )
+    self.ff = builder.build_ff(model_config.embedding_dim, ff_config_no_norms)
 
     # Gemma3n-specific components
     self.laurel = LaurelBlock(hidden_size, laurel_rank, eps=eps)
@@ -290,12 +310,12 @@ class Gemma3nDecoderBlock(nn.Module):
   def forward(
       self,
       hidden_states: torch.Tensor,
-      rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-      mask: Optional[torch.Tensor] = None,
-      input_pos: Optional[torch.Tensor] = None,
-      kv_cache: kv_utils.KVCacheEntry = None,
-      per_layer_input: Optional[torch.Tensor] = None,
-  ) -> Tuple[torch.Tensor, Optional[kv_utils.KVCacheEntry]]:
+      rope: Tuple[torch.Tensor, torch.Tensor],
+      mask: torch.Tensor,
+      input_pos: torch.Tensor,
+      kv_cache: kv_utils.KVCacheEntry,
+      per_layer_input: torch.Tensor,
+  ) -> Tuple[torch.Tensor, kv_utils.KVCacheEntry]:
     """Forward pass of Gemma3n decoder block.
 
     Args:
@@ -327,25 +347,32 @@ class Gemma3nDecoderBlock(nn.Module):
     attn_gated = active_prediction + attn_out
     attn_laurel = (attn_gated + laurel_output) / math.sqrt(2)
 
-    # Feed-forward
-    ff_out = self.ff(attn_laurel)
+    # Feed-forward with explicit pre/post norms
+    ff_input = self.pre_ff_norm(attn_laurel)
+    ff_out = self.ff(ff_input)
+    ff_out = self.post_ff_norm(ff_out)
     attn_ff = attn_laurel + ff_out
 
     # AltUp correct step
     corrected = self.altup.correct(predictions, attn_ff)
 
-    # Apply per-layer embeddings
-    first_prediction = corrected[self.altup_active_idx].clone()
-    first_prediction = self.altup.scale_corrected_output(first_prediction)
+    # Apply per-layer embeddings to non-active predictions
+    first_prediction = corrected[self.altup_active_idx]
+    scaled_prediction = self.altup.scale_corrected_output(first_prediction)
 
-    if per_layer_input is not None:
-      gate = self.act_fn(self.per_layer_input_gate(first_prediction))
-      per_layer_out = gate * per_layer_input
-      per_layer_out = self.per_layer_projection(per_layer_out)
-      per_layer_out = self.post_per_layer_norm(per_layer_out)
-      corrected[1:] = corrected[1:] + per_layer_out
+    gate = self.act_fn(self.per_layer_input_gate(scaled_prediction))
+    per_layer_out = gate * per_layer_input
+    per_layer_out = self.per_layer_projection(per_layer_out)
+    per_layer_out = self.post_per_layer_norm(per_layer_out)
 
-    return corrected, kv
+    # Create new tensor with updated values (avoid in-place modification)
+    # corrected[1:] += per_layer_out becomes:
+    result_parts = [corrected[0:1]]  # Keep first unchanged
+    for i in range(1, self.altup_num_inputs):
+      result_parts.append(corrected[i:i+1] + per_layer_out.unsqueeze(0))
+    result = torch.cat(result_parts, dim=0)
+
+    return result, kv
 
 
 class Decoder(nn.Module):
@@ -430,13 +457,7 @@ class Decoder(nn.Module):
 
     self.altup_num_inputs = altup_num_inputs
     self.altup_active_idx = 0
-    self.build_mask_cache(0)
-
-  def build_mask_cache(self, mask_cache_size: int):
-    if mask_cache_size <= 0:
-      self.mask_cache = None
-    else:
-      self.mask_cache = attn_utils.build_causal_mask_cache(mask_cache_size)
+    self.mask_cache = None
 
   def get_per_layer_inputs(
       self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor
@@ -471,7 +492,7 @@ class Decoder(nn.Module):
       Expanded states: [num_altup_inputs, batch, seq_len, hidden_size]
     """
     target_magnitude = torch.mean(hidden_states**2, dim=-1, keepdim=True) ** 0.5
-    epsilon = torch.tensor(1e-5, device=hidden_states.device)
+    epsilon = torch.tensor(1e-5, device=hidden_states.device, dtype=hidden_states.dtype)
 
     expanded = [hidden_states]
     for proj in self.altup_projections:
@@ -497,7 +518,7 @@ class Decoder(nn.Module):
     target_magnitude = (
         torch.mean(hidden_states[0] ** 2, dim=-1, keepdim=True) ** 0.5
     )
-    epsilon = torch.tensor(1e-5, device=hidden_states.device)
+    epsilon = torch.tensor(1e-5, device=hidden_states.device, dtype=hidden_states.dtype)
 
     collapsed = [hidden_states[0]]
     for i, proj in enumerate(self.altup_unembed_projections):
@@ -512,42 +533,44 @@ class Decoder(nn.Module):
 
   def get_attention_mask(
       self,
-      mask: Optional[torch.Tensor],
-      input_pos: torch.Tensor,
-      kv_cache: Optional[kv_utils.KVCache],
+      mask: torch.Tensor,
       attn_config: cfg.AttentionConfig,
+      input_pos: torch.Tensor,
+      kv_cache_max_len: int,
   ) -> torch.Tensor:
     """Get attention mask with optional sliding window."""
-    if mask is not None:
-      return mask
-
-    assert self.mask_cache is not None, "Mask cache must be built."
-    assert kv_cache is not None, "KV cache must be provided."
-
-    base_mask = self.mask_cache.index_select(2, input_pos)
-    kv_cache_max_len = kv_cache.get_max_seq_len()
-    base_mask = base_mask[:, :, :, :kv_cache_max_len]
-
-    # Apply sliding window if configured
     if attn_config.attn_type == cfg.AttentionType.LOCAL_SLIDING:
       sliding_window = attn_config.sliding_window_size
       if sliding_window is not None:
-        seq_len = input_pos.shape[0]
-        cache_positions = torch.arange(kv_cache_max_len, device=input_pos.device)
-        cache_positions = cache_positions.view(1, 1, 1, -1)
-        input_pos_expanded = input_pos.view(1, 1, -1, 1)
-
-        left_bound = cache_positions > input_pos_expanded - sliding_window
-        right_bound = cache_positions <= input_pos_expanded
-
-        sliding_mask = torch.where(
-            left_bound & right_bound,
-            torch.zeros_like(base_mask),
-            torch.full_like(base_mask, float("-inf")),
+        sliding_mask = self._create_sliding_mask(
+            input_pos, kv_cache_max_len, sliding_window
         )
-        base_mask = torch.minimum(base_mask, sliding_mask)
+        # Combine masks using minimum (preserves -inf)
+        return torch.minimum(mask, sliding_mask)
+    return mask
 
-    return base_mask
+  def _create_sliding_mask(
+      self,
+      input_pos: torch.Tensor,
+      cache_len: int,
+      sliding_window_size: int,
+  ) -> torch.Tensor:
+    """Creates mask for sliding window attention."""
+    cache_positions = torch.arange(cache_len, dtype=torch.int32, device=input_pos.device)
+    cache_positions = cache_positions.view(1, 1, 1, -1)
+    segment_pos = input_pos.view(1, 1, -1, 1)
+
+    left_boundary = cache_positions > segment_pos - sliding_window_size
+    right_boundary = cache_positions < segment_pos + sliding_window_size
+
+    sliding_mask_bool = left_boundary & right_boundary
+
+    sliding_mask = torch.where(
+        sliding_mask_bool,
+        torch.zeros_like(sliding_mask_bool, dtype=torch.float32),
+        torch.full_like(sliding_mask_bool, float("-inf"), dtype=torch.float32),
+    )
+    return sliding_mask
 
   @torch.inference_mode
   def forward(
@@ -557,7 +580,7 @@ class Decoder(nn.Module):
       kv_cache: kv_utils.KVCache,
       mask: Optional[torch.Tensor] = None,
       export_config: Optional[export_cfg.ExportConfig] = None,
-  ) -> dict:
+  ) -> Dict[str, Union[torch.Tensor, kv_utils.KVCache]]:
     """Forward pass of the decoder.
 
     Args:
@@ -584,32 +607,47 @@ class Decoder(nn.Module):
     # Expand for AltUp
     hidden_states = self.expand_hidden_states(input_embeds)
 
-    # Build RoPE embeddings (use first layer's config for parameters)
+    # Build RoPE for each layer (different rotary base for local vs global)
     attn_config = self.config.block_config(0).attn_config
-    n_elem = int(attn_config.rotary_percentage * attn_config.head_dim)
+    rope_list = [
+        rotary_pos_emb.build_rope(
+            input_pos,
+            attn_config.head_dim,
+            self.config.block_config(i).attn_config.rotary_base,
+        )
+        for i in range(self.config.num_layers)
+    ]
+
+    # Handle mask
+    if mask is None:
+      assert self.mask_cache is not None, "Mask cache must be built."
+      kv_cache_max_len = kv_cache.get_max_seq_len()
+      mask = self.mask_cache.index_select(2, input_pos)
+      mask = mask[:, :, :, :kv_cache_max_len]
+    else:
+      kv_cache_max_len = mask.size(-1)
+
+    # Build per-layer masks with sliding window handling
+    mask_list = [
+        self.get_attention_mask(
+            mask,
+            self.config.block_config(i).attn_config,
+            input_pos,
+            kv_cache_max_len,
+        )
+        for i in range(self.config.num_layers)
+    ]
 
     # Process through transformer blocks
     updated_kv_entries = []
     for i, block in enumerate(self.transformer_blocks):
-      block_attn_config = self.config.block_config(i).attn_config
-
-      # Get appropriate RoPE for this layer's attention type
-      rope = self.config.build_rope(
-          input_pos, n_elem, block_attn_config.rotary_base
-      )
-
-      # Get mask for this layer
-      layer_mask = self.get_attention_mask(
-          mask, input_pos, kv_cache, block_attn_config
-      )
-
       kv_entry = kv_cache.caches[i] if kv_cache else None
       per_layer_input = per_layer_inputs[:, :, i, :]
 
       hidden_states, kv_entry = block(
           hidden_states,
-          rope,
-          layer_mask,
+          rope_list[i],
+          mask_list[i],
           input_pos,
           kv_entry,
           per_layer_input,
@@ -657,6 +695,7 @@ def get_model_config_e2b() -> Tuple[cfg.ModelConfig, dict]:
       type=cfg.FeedForwardType.GATED,
       activation=cfg.ActivationConfig(cfg.ActivationType.GELU_TANH),
       intermediate_size=8192,
+      use_separate_gating=True,
       pre_ff_norm_config=norm_config,
       post_ff_norm_config=norm_config,
   )
@@ -731,6 +770,7 @@ def get_model_config_e4b() -> Tuple[cfg.ModelConfig, dict]:
       type=cfg.FeedForwardType.GATED,
       activation=cfg.ActivationConfig(cfg.ActivationType.GELU_TANH),
       intermediate_size=16384,
+      use_separate_gating=True,
       pre_ff_norm_config=norm_config,
       post_ff_norm_config=norm_config,
   )
@@ -791,14 +831,21 @@ def get_model_config_e4b() -> Tuple[cfg.ModelConfig, dict]:
   return model_config, gemma3n_config
 
 
+def _build_mask_cache(max_seq_len: int) -> torch.Tensor:
+  """Build causal mask cache."""
+  return attn_utils.build_causal_mask_cache(max_seq_len)
+
+
 def build_model_e2b(
     checkpoint_path: str,
+    custom_loader: Callable[[str], Dict[str, torch.Tensor]] = None,
     mask_cache_size: int = 0,
 ) -> Decoder:
   """Builds a Gemma3n E2B model.
 
   Args:
     checkpoint_path: Path to the model checkpoint.
+    custom_loader: Optional custom checkpoint loader function.
     mask_cache_size: Size of the attention mask cache.
 
   Returns:
@@ -807,10 +854,11 @@ def build_model_e2b(
   model_config, gemma3n_config = get_model_config_e2b()
   model = Decoder(model_config, gemma3n_config)
 
-  if checkpoint_path:
-    model.build_mask_cache(mask_cache_size)
-    # Note: Custom loader would be needed for Gemma3n's unique weight structure
-    # For now, this creates an uninitialized model that can be loaded separately
+  if mask_cache_size > 0:
+    model.mask_cache = _build_mask_cache(mask_cache_size)
+
+  # Note: Custom weight loading for Gemma3n's unique structure would go here
+  # For now, weights need to be loaded separately
 
   model.eval()
   return model
@@ -818,12 +866,14 @@ def build_model_e2b(
 
 def build_model_e4b(
     checkpoint_path: str,
+    custom_loader: Callable[[str], Dict[str, torch.Tensor]] = None,
     mask_cache_size: int = 0,
 ) -> Decoder:
   """Builds a Gemma3n E4B model.
 
   Args:
     checkpoint_path: Path to the model checkpoint.
+    custom_loader: Optional custom checkpoint loader function.
     mask_cache_size: Size of the attention mask cache.
 
   Returns:
@@ -832,8 +882,8 @@ def build_model_e4b(
   model_config, gemma3n_config = get_model_config_e4b()
   model = Decoder(model_config, gemma3n_config)
 
-  if checkpoint_path:
-    model.build_mask_cache(mask_cache_size)
+  if mask_cache_size > 0:
+    model.mask_cache = _build_mask_cache(mask_cache_size)
 
   model.eval()
   return model
