@@ -1,3 +1,12 @@
+> [!IMPORTANT]
+> **This is a fork** focused on adding support for **Google Gemma 3n (Matformer / Matryoshka Transformer)**. The Gemma 3n implementation was assisted by AI and includes experimental support for:
+> - **AltUp** (Alternating Updates) - Sparse update mechanism for efficiency
+> - **LAuReL** (Learned Augmented Residual Layer) - Low-rank residual connections
+> - **Per-Layer Embeddings (PLE)** - Token-specific embeddings injected at each layer
+> - **Hybrid Attention** - Mix of sliding window (local) and full (global) attention
+>
+> See [implementation_walkthrough.md](implementation_walkthrough.md) for detailed documentation on the Gemma 3n implementation.
+
 # AI Edge Torch
 
 AI Edge Torch is a python library that supports converting PyTorch models into a
@@ -84,15 +93,29 @@ Nightly Release    | [![](https://github.com/google-ai-edge/ai-edge-torch/action
 
 <!-- requirement badges are updated by ci/update_nightly_versions.py -->
 
-### Python Virtual Env
+### Installing This Fork (with Gemma 3n Support)
 
-Set up a Python virtualenv:
+To install this fork with Gemma 3n support, clone the repository and install in development mode:
+
 ```bash
+# Clone this fork
+git clone https://github.com/Kuba-csproj/ai-edge-torch.git
+cd ai-edge-torch
+
+# Create a virtual environment
 python -m venv --prompt ai-edge-torch venv
-source venv/bin/activate
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install in development mode
+pip install -e .
+
+# Install additional dependencies
+pip install -r requirements.txt
 ```
 
-The latest stable release can be installed with:
+### Installing the Original Package (PyPI)
+
+The latest stable release of the original AI Edge Torch (without Gemma 3n support) can be installed with:
 ```bash
 pip install ai-edge-torch
 ```
@@ -101,7 +124,6 @@ Alternately, the nightly version can be installed with:
 ```bash
 pip install ai-edge-torch-nightly
 ```
-
 
 * The list of versioned releases can be seen [here](https://github.com/google-ai-edge/ai-edge-torch/releases).
 * The full list of PyPi releases (including nightly builds) can be seen [here](https://pypi.org/project/ai-edge-torch/#history).

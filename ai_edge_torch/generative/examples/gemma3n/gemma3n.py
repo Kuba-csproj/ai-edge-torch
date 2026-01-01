@@ -67,6 +67,87 @@ TENSOR_NAMES = loading_utils.ModelLoader.TensorNames(
 )
 
 
+def load_gemma3n_weights(model: nn.Module, checkpoint_path: str):
+  """Loads Gemma3n weights from checkpoint.
+
+  This function handles the complete weight loading for Gemma3n, including
+  standard transformer weights and custom Gemma3n-specific weights (AltUp,
+  Laurel, PerLayer embeddings).
+  """
+  # Load raw state dict
+  state_dict = loading_utils.load_safetensors(checkpoint_path)
+  if "model_state_dict" in state_dict:
+    state_dict = state_dict["model_state_dict"]
+
+  converted_state = {}
+
+  # === Global embeddings ===
+  converted_state["tok_embedding.weight"] = state_dict["model.embed_tokens.weight"]
+  converted_state["final_norm.weight"] = state_dict["model.norm.weight"]
+
+  # Per-layer embeddings
+  converted_state["per_layer_embedding.embedding.weight"] = state_dict["model.embed_tokens_per_layer.weight"]
+  converted_state["per_layer_model_projection.weight"] = state_dict["model.per_layer_model_projection.weight"]
+  converted_state["per_layer_projection_norm.weight"] = state_dict["model.per_layer_projection_norm.weight"]
+
+  # Global AltUp projections
+  for i in range(len(model.altup_projections)):
+    converted_state[f"altup_projections.{i}.weight"] = state_dict[f"model.altup_projections.{i}.weight"]
+  for i in range(len(model.altup_unembed_projections)):
+    converted_state[f"altup_unembed_projections.{i}.weight"] = state_dict[f"model.altup_unembed_projections.{i}.weight"]
+
+  # === Per-layer weights ===
+  for i in range(model.config.num_layers):
+    src = f"model.layers.{i}"
+    dst = f"transformer_blocks.{i}"
+
+    # Norms (sibling to atten_func and ff)
+    converted_state[f"{dst}.pre_atten_norm.weight"] = state_dict[f"{src}.input_layernorm.weight"]
+    converted_state[f"{dst}.post_atten_norm.weight"] = state_dict[f"{src}.post_attention_layernorm.weight"]
+    converted_state[f"{dst}.pre_ff_norm.weight"] = state_dict[f"{src}.pre_feedforward_layernorm.weight"]
+    converted_state[f"{dst}.post_ff_norm.weight"] = state_dict[f"{src}.post_feedforward_layernorm.weight"]
+
+    # Attention
+    attn_config = model.config.block_config(i).attn_config
+    q = state_dict[f"{src}.self_attn.q_proj.weight"]
+    k = state_dict[f"{src}.self_attn.k_proj.weight"]
+    v = state_dict[f"{src}.self_attn.v_proj.weight"]
+    # Fuse QKV (non-interleaved)
+    converted_state[f"{dst}.atten_func.qkv_projection.weight"] = torch.cat([q, k, v], dim=0)
+    converted_state[f"{dst}.atten_func.output_projection.weight"] = state_dict[f"{src}.self_attn.o_proj.weight"]
+
+    # Attention norms (Q/K norms)
+    if f"{src}.self_attn.q_norm.weight" in state_dict:
+      converted_state[f"{dst}.atten_func.query_norm.weight"] = state_dict[f"{src}.self_attn.q_norm.weight"]
+    if f"{src}.self_attn.k_norm.weight" in state_dict:
+      converted_state[f"{dst}.atten_func.key_norm.weight"] = state_dict[f"{src}.self_attn.k_norm.weight"]
+
+    # Feedforward (gated: w1=gate, w2=down, w3=up)
+    converted_state[f"{dst}.ff.w1.weight"] = state_dict[f"{src}.mlp.gate_proj.weight"]
+    converted_state[f"{dst}.ff.w2.weight"] = state_dict[f"{src}.mlp.down_proj.weight"]
+    converted_state[f"{dst}.ff.w3.weight"] = state_dict[f"{src}.mlp.up_proj.weight"]
+
+    # Laurel
+    converted_state[f"{dst}.laurel.linear_left.weight"] = state_dict[f"{src}.laurel.linear_left.weight"]
+    converted_state[f"{dst}.laurel.linear_right.weight"] = state_dict[f"{src}.laurel.linear_right.weight"]
+    converted_state[f"{dst}.laurel.post_laurel_norm.weight"] = state_dict[f"{src}.laurel.post_laurel_norm.weight"]
+
+    # AltUp (per-layer)
+    converted_state[f"{dst}.altup.correct_output_scale"] = state_dict[f"{src}.altup.correct_output_scale"]
+    converted_state[f"{dst}.altup.correction_coefs.weight"] = state_dict[f"{src}.altup.correction_coefs.weight"]
+    converted_state[f"{dst}.altup.prediction_coefs.weight"] = state_dict[f"{src}.altup.prediction_coefs.weight"]
+    converted_state[f"{dst}.altup.modality_router.weight"] = state_dict[f"{src}.altup.modality_router.weight"]
+    converted_state[f"{dst}.altup.router_norm.weight"] = state_dict[f"{src}.altup.router_norm.weight"]
+
+    # Per-layer input integration
+    converted_state[f"{dst}.per_layer_input_gate.weight"] = state_dict[f"{src}.per_layer_input_gate.weight"]
+    converted_state[f"{dst}.per_layer_projection.weight"] = state_dict[f"{src}.per_layer_projection.weight"]
+    converted_state[f"{dst}.post_per_layer_norm.weight"] = state_dict[f"{src}.post_per_layer_input_norm.weight"]
+
+  model.load_state_dict(converted_state, strict=False)
+
+
+
 class RMSNorm(nn.Module):
   """RMS Normalization layer."""
 
@@ -601,6 +682,7 @@ class Decoder(nn.Module):
     if self.config.embedding_scale is not None:
       input_embeds = input_embeds * self.config.embedding_scale
 
+
     # Get per-layer inputs
     per_layer_inputs = self.get_per_layer_inputs(tokens, input_embeds)
 
@@ -857,8 +939,7 @@ def build_model_e2b(
   if mask_cache_size > 0:
     model.mask_cache = _build_mask_cache(mask_cache_size)
 
-  # Note: Custom weight loading for Gemma3n's unique structure would go here
-  # For now, weights need to be loaded separately
+  load_gemma3n_weights(model, checkpoint_path)
 
   model.eval()
   return model
@@ -884,6 +965,8 @@ def build_model_e4b(
 
   if mask_cache_size > 0:
     model.mask_cache = _build_mask_cache(mask_cache_size)
+
+  load_gemma3n_weights(model, checkpoint_path)
 
   model.eval()
   return model
