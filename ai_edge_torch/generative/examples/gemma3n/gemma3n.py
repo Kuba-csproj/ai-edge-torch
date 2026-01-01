@@ -362,23 +362,30 @@ class SparseGatedMLP(nn.Module):
     self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
     self.act_fn = lambda x: F.gelu(x, approximate="tanh")
 
+    # Precompute std_multiplier for activation sparsity to avoid erfinv at runtime
+    # (erfinv is not supported by TFLite)
+    if self.activation_sparsity > 0.0:
+      import math
+      # icdf(p) for standard normal = sqrt(2) * erfinv(2*p - 1)
+      # For p=0.95: icdf(0.95) ≈ 1.6449
+      std_mult_value = math.sqrt(2) * math.erfc(2 * (1 - self.activation_sparsity)) 
+      # Use scipy-style calculation for accuracy
+      normal_dist = torch.distributions.normal.Normal(0, 1)
+      std_mult_value = float(normal_dist.icdf(torch.tensor(self.activation_sparsity)))
+      self.register_buffer(
+          "std_multiplier", torch.tensor(std_mult_value), persistent=False
+      )
+
   def _gaussian_topk(self, inputs: torch.Tensor) -> torch.Tensor:
     """Apply Gaussian top-k sparsity by zeroing values below a threshold.
 
     The threshold is computed as: mean + std * icdf(sparsity)
     where icdf is the inverse cumulative distribution function of N(0,1).
+    The std_multiplier (icdf value) is precomputed in __init__ for TFLite compatibility.
     """
-    target_sparsity = torch.tensor(
-        self.activation_sparsity, dtype=torch.float32, device=inputs.device
-    )
-    # Compute inverse CDF of standard normal at target sparsity percentile
-    normal_dist = torch.distributions.normal.Normal(0, 1)
-    std_multiplier = normal_dist.icdf(target_sparsity)
-    std_multiplier = std_multiplier.to(inputs.dtype)
-
     inputs_mean = torch.mean(inputs, dim=-1, keepdim=True)
     inputs_std = torch.std(inputs, dim=-1, keepdim=True, unbiased=False)
-    cutoff = inputs_mean + inputs_std * std_multiplier
+    cutoff = inputs_mean + inputs_std * self.std_multiplier.to(inputs.dtype)
 
     return F.relu(inputs - cutoff)
 
