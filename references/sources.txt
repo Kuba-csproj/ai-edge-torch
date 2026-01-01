@@ -1,0 +1,19 @@
+﻿Sources for the references used in this project. And ofc a lot of thanks to the people behind them.
+---
+
+gemma3n-configs
+https://huggingface.co/google/gemma-3n-E4B
+The Gemma team at Google
+License: https://ai.google.dev/gemma/terms
+
+Note: All the file names were prepended with "gemma3n_E2B_" for clarity.
+---
+
+reverse-engineering-gemma-3n
+https://github.com/antimatter15/reverse-engineering-gemma-3n
+Antimatter15
+---
+
+generic-research.txt
+gemini.google.com - research mode
+The Gemini team at Google
