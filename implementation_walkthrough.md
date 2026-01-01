@@ -98,10 +98,11 @@ ai_edge_torch/generative/examples/gemma3n/
 | `LaurelBlock` | gemma3n.py:168 | LAuReL residual connection |
 | `AltUp` | gemma3n.py:190 | Alternating updates module |
 | `PerLayerEmbedding` | gemma3n.py:280 | Per-layer embedding lookup |
-| `Gemma3nDecoderBlock` | gemma3n.py:323 | Single decoder layer |
-| `Decoder` | gemma3n.py:459 | Full decoder model |
-| `build_model_e2b` | gemma3n.py:921 | E2B model builder |
-| `build_model_e4b` | gemma3n.py:948 | E4B model builder |
+| `SparseGatedMLP` | gemma3n.py:323 | MLP with Gaussian top-k activation sparsity |
+| `Gemma3nDecoderBlock` | gemma3n.py:376 | Single decoder layer with KV sharing support |
+| `Decoder` | gemma3n.py:520 | Full decoder model with KV sharing map |
+| `build_model_e2b` | gemma3n.py:980 | E2B model builder |
+| `build_model_e4b` | gemma3n.py:1010 | E4B model builder |
 | `load_gemma3n_weights` | gemma3n.py:70 | Custom weight loader |
 
 ---
@@ -151,7 +152,7 @@ The `load_gemma3n_weights` function handles the complete mapping from HuggingFac
 ```python
 # HuggingFace format → Our format
 "model.layers.{i}.self_attn.q_proj.weight" → "transformer_blocks.{i}.atten_func.qkv_projection.weight" (fused with K, V)
-"model.layers.{i}.mlp.gate_proj.weight" → "transformer_blocks.{i}.ff.w1.weight"
+"model.layers.{i}.mlp.gate_proj.weight" → "transformer_blocks.{i}.ff.gate_proj.weight"
 "model.layers.{i}.laurel.linear_left.weight" → "transformer_blocks.{i}.laurel.linear_left.weight"
 "model.layers.{i}.altup.correction_coefs.weight" → "transformer_blocks.{i}.altup.correction_coefs.weight"
 ```
@@ -344,13 +345,15 @@ converter.convert_to_tflite(
 
 1. **Text-only support**: This implementation only supports the text decoder. Vision and audio encoders from the full Gemma 3n model are not included.
 
-2. **KV cache sharing**: The config includes `num_kv_shared_layers` but the current implementation does not implement KV cache sharing between layers. Each layer maintains its own KV cache.
+2. **No verification against reference**: The implementation has not been verified against the original HuggingFace implementation for numerical accuracy.
 
-3. **Activation sparsity**: The `activation_sparsity_pattern` config is defined but not applied during inference. The full activation sparsity from the original implementation would require additional optimization.
+3. **Weight loading assumes specific format**: The weight loader expects HuggingFace SafeTensors format. Other checkpoint formats may require modifications.
 
-4. **No verification against reference**: The implementation has not been verified against the original HuggingFace implementation for numerical accuracy.
+### Implemented Features ✓
 
-5. **Weight loading assumes specific format**: The weight loader expects HuggingFace SafeTensors format. Other checkpoint formats may require modifications.
+- **KV Cache Sharing**: Later layers reuse KV cache from earlier layers of the same attention type (sliding/global). Configured via `num_kv_shared_layers` in gemma3n_config.
+
+- **Activation Sparsity**: Gaussian top-k sparsity applied to MLP gate projections. First 10 layers use 0.95 sparsity, rest are dense. Configured via `activation_sparsity_pattern`.
 
 ---
 

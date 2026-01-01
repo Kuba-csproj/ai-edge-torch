@@ -122,10 +122,11 @@ def load_gemma3n_weights(model: nn.Module, checkpoint_path: str):
     if f"{src}.self_attn.k_norm.weight" in state_dict:
       converted_state[f"{dst}.atten_func.key_norm.weight"] = state_dict[f"{src}.self_attn.k_norm.weight"]
 
-    # Feedforward (gated: w1=gate, w2=down, w3=up)
-    converted_state[f"{dst}.ff.w1.weight"] = state_dict[f"{src}.mlp.gate_proj.weight"]
-    converted_state[f"{dst}.ff.w2.weight"] = state_dict[f"{src}.mlp.down_proj.weight"]
-    converted_state[f"{dst}.ff.w3.weight"] = state_dict[f"{src}.mlp.up_proj.weight"]
+    # Feedforward (SparseGatedMLP: gate_proj, up_proj, down_proj)
+    converted_state[f"{dst}.ff.gate_proj.weight"] = state_dict[f"{src}.mlp.gate_proj.weight"]
+    converted_state[f"{dst}.ff.down_proj.weight"] = state_dict[f"{src}.mlp.down_proj.weight"]
+    converted_state[f"{dst}.ff.up_proj.weight"] = state_dict[f"{src}.mlp.up_proj.weight"]
+
 
     # Laurel
     converted_state[f"{dst}.laurel.linear_left.weight"] = state_dict[f"{src}.laurel.linear_left.weight"]
@@ -320,6 +321,59 @@ class PerLayerEmbedding(nn.Module):
     )
 
 
+class SparseGatedMLP(nn.Module):
+  """Gated MLP with optional Gaussian top-k activation sparsity.
+
+  When activation_sparsity > 0, applies a Gaussian-based threshold to the
+  gate projections, zeroing out values below a percentile cutoff.
+
+  Reference: HuggingFace Gemma3n implementation
+  """
+
+  def __init__(
+      self,
+      hidden_size: int,
+      intermediate_size: int,
+      activation_sparsity: float = 0.0,
+      eps: float = 1e-6,
+  ):
+    super().__init__()
+    self.hidden_size = hidden_size
+    self.intermediate_size = intermediate_size
+    self.activation_sparsity = activation_sparsity
+
+    self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+    self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+    self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+    self.act_fn = lambda x: F.gelu(x, approximate="tanh")
+
+  def _gaussian_topk(self, inputs: torch.Tensor) -> torch.Tensor:
+    """Apply Gaussian top-k sparsity by zeroing values below a threshold.
+
+    The threshold is computed as: mean + std * icdf(sparsity)
+    where icdf is the inverse cumulative distribution function of N(0,1).
+    """
+    target_sparsity = torch.tensor(
+        self.activation_sparsity, dtype=torch.float32, device=inputs.device
+    )
+    # Compute inverse CDF of standard normal at target sparsity percentile
+    normal_dist = torch.distributions.normal.Normal(0, 1)
+    std_multiplier = normal_dist.icdf(target_sparsity)
+    std_multiplier = std_multiplier.to(inputs.dtype)
+
+    inputs_mean = torch.mean(inputs, dim=-1, keepdim=True)
+    inputs_std = torch.std(inputs, dim=-1, keepdim=True, unbiased=False)
+    cutoff = inputs_mean + inputs_std * std_multiplier
+
+    return F.relu(inputs - cutoff)
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    gate = self.gate_proj(x)
+    if self.activation_sparsity > 0.0:
+      gate = self._gaussian_topk(gate)
+    return self.down_proj(self.act_fn(gate) * self.up_proj(x))
+
+
 class Gemma3nDecoderBlock(nn.Module):
   """Gemma3n decoder block with LAuReL, AltUp, and per-layer embeddings."""
 
@@ -332,6 +386,8 @@ class Gemma3nDecoderBlock(nn.Module):
       per_layer_dim: int,
       laurel_rank: int,
       altup_num_inputs: int,
+      activation_sparsity: float = 0.0,
+      is_kv_shared_layer: bool = False,
       eps: float = 1e-6,
   ):
     super().__init__()
@@ -340,6 +396,7 @@ class Gemma3nDecoderBlock(nn.Module):
     self.per_layer_dim = per_layer_dim
     self.altup_active_idx = 0
     self.altup_num_inputs = altup_num_inputs
+    self.is_kv_shared_layer = is_kv_shared_layer
 
     # Standard transformer components
     self.pre_atten_norm = builder.build_norm(
@@ -362,17 +419,14 @@ class Gemma3nDecoderBlock(nn.Module):
         model_config.embedding_dim, config.ff_config.post_ff_norm_config
     )
 
-    # Build feedforward WITHOUT internal norms (we apply them separately)
-    ff_config_no_norms = cfg.FeedForwardConfig(
-        type=config.ff_config.type,
-        activation=config.ff_config.activation,
+    # Build feedforward with optional activation sparsity
+    # Using SparseGatedMLP instead of builder.build_ff for sparsity support
+    self.ff = SparseGatedMLP(
+        hidden_size=model_config.embedding_dim,
         intermediate_size=config.ff_config.intermediate_size,
-        use_bias=config.ff_config.use_bias,
-        use_separate_gating=True,
-        pre_ff_norm_config=None,  # No internal norms
-        post_ff_norm_config=None,
+        activation_sparsity=activation_sparsity,
+        eps=eps,
     )
-    self.ff = builder.build_ff(model_config.embedding_dim, ff_config_no_norms)
 
     # Gemma3n-specific components
     self.laurel = LaurelBlock(hidden_size, laurel_rank, eps=eps)
@@ -396,6 +450,7 @@ class Gemma3nDecoderBlock(nn.Module):
       input_pos: torch.Tensor,
       kv_cache: kv_utils.KVCacheEntry,
       per_layer_input: torch.Tensor,
+      shared_kv: Optional[kv_utils.KVCacheEntry] = None,
   ) -> Tuple[torch.Tensor, kv_utils.KVCacheEntry]:
     """Forward pass of Gemma3n decoder block.
 
@@ -404,8 +459,10 @@ class Gemma3nDecoderBlock(nn.Module):
       rope: Rotary position embeddings (cos, sin)
       mask: Attention mask
       input_pos: Input positions for KV cache
-      kv_cache: KV cache entry
+      kv_cache: KV cache entry for this layer
       per_layer_input: Per-layer embeddings [batch, seq_len, per_layer_dim]
+      shared_kv: Optional pre-computed KV cache entry from an earlier layer
+        (used when this is a KV-shared layer)
 
     Returns:
       Updated hidden states and KV cache entry.
@@ -419,9 +476,14 @@ class Gemma3nDecoderBlock(nn.Module):
     laurel_output = self.laurel(active_normed)
 
     # Self-attention
+    # If this is a KV-shared layer, we use the shared KV cache from an earlier layer
+    effective_kv = shared_kv if (self.is_kv_shared_layer and shared_kv is not None) else kv_cache
     attn_out, kv = self.atten_func(
-        active_normed, rope, mask, input_pos, kv_cache
+        active_normed, rope, mask, input_pos, effective_kv
     )
+    # For shared layers, we don't update the KV cache - keep the original
+    if self.is_kv_shared_layer and shared_kv is not None:
+      kv = kv_cache  # Return original cache unchanged
     attn_out = self.post_atten_norm(attn_out)
 
     # Combine attention with LAuReL
@@ -511,7 +573,34 @@ class Decoder(nn.Module):
         for _ in range(1, altup_num_inputs)
     ])
 
-    # Transformer blocks
+    # Compute layer types and KV sharing map
+    num_kv_shared_layers = gemma3n_config.get("num_kv_shared_layers", 0)
+    activation_sparsity_pattern = gemma3n_config.get(
+        "activation_sparsity_pattern", [0.0] * num_layers
+    )
+    first_kv_shared_idx = num_layers - num_kv_shared_layers
+
+    # Determine layer types: 'global' (every 5th layer) or 'sliding' (rest)
+    self.layer_types = []
+    for i in range(num_layers):
+      is_global = (i + 1) % 5 == 0
+      self.layer_types.append('global' if is_global else 'sliding')
+
+    # Compute KV sharing map: shared_layer_idx -> source_layer_idx
+    # Later layers of the same type share KV cache with earlier non-shared layers
+    self.kv_sharing_map = {}  # layer_idx -> source_layer_idx (or None)
+    self.kv_source_layers = set()  # Layers that need to store KV for sharing
+
+    for i in range(first_kv_shared_idx, num_layers):
+      layer_type = self.layer_types[i]
+      # Find the last non-shared layer of the same type
+      for j in range(first_kv_shared_idx - 1, -1, -1):
+        if self.layer_types[j] == layer_type:
+          self.kv_sharing_map[i] = j
+          self.kv_source_layers.add(j)
+          break
+
+    # Transformer blocks with activation sparsity and KV sharing config
     self.transformer_blocks = nn.ModuleList([
         Gemma3nDecoderBlock(
             config.block_config(idx),
@@ -521,6 +610,8 @@ class Decoder(nn.Module):
             per_layer_dim=per_layer_dim,
             laurel_rank=laurel_rank,
             altup_num_inputs=altup_num_inputs,
+            activation_sparsity=activation_sparsity_pattern[idx],
+            is_kv_shared_layer=(idx in self.kv_sharing_map),
             eps=eps,
         )
         for idx in range(num_layers)
@@ -720,11 +811,19 @@ class Decoder(nn.Module):
         for i in range(self.config.num_layers)
     ]
 
-    # Process through transformer blocks
+    # Process through transformer blocks with KV sharing
     updated_kv_entries = []
+    shared_kv_storage = {}  # layer_idx -> KVCacheEntry for sharing
+
     for i, block in enumerate(self.transformer_blocks):
       kv_entry = kv_cache.caches[i] if kv_cache else None
       per_layer_input = per_layer_inputs[:, :, i, :]
+
+      # Get shared KV if this is a shared layer
+      shared_kv = None
+      if i in self.kv_sharing_map:
+        source_layer = self.kv_sharing_map[i]
+        shared_kv = shared_kv_storage.get(source_layer)
 
       hidden_states, kv_entry = block(
           hidden_states,
@@ -733,7 +832,12 @@ class Decoder(nn.Module):
           input_pos,
           kv_entry,
           per_layer_input,
+          shared_kv=shared_kv,
       )
+
+      # Store KV cache for layers that are sources for sharing
+      if i in self.kv_source_layers and kv_entry is not None:
+        shared_kv_storage[i] = kv_entry
 
       if kv_entry:
         updated_kv_entries.append(kv_entry)
@@ -773,6 +877,14 @@ def get_model_config_e2b() -> Tuple[cfg.ModelConfig, dict]:
       zero_centered=False,
   )
 
+  # Value norm has no learnable scale parameter (with_scale=False)
+  value_norm_config = cfg.NormalizationConfig(
+      type=cfg.NormalizationType.RMS_NORM,
+      epsilon=1e-6,
+      zero_centered=False,
+      with_scale=False,
+  )
+
   ff_config = cfg.FeedForwardConfig(
       type=cfg.FeedForwardType.GATED,
       activation=cfg.ActivationConfig(cfg.ActivationType.GELU_TANH),
@@ -796,6 +908,7 @@ def get_model_config_e2b() -> Tuple[cfg.ModelConfig, dict]:
         qkv_transpose_before_split=True,
         query_norm_config=norm_config,
         key_norm_config=norm_config,
+        value_norm_config=value_norm_config,
         logit_softcap=None,
         sliding_window_size=512,
         attn_type=(
@@ -848,6 +961,14 @@ def get_model_config_e4b() -> Tuple[cfg.ModelConfig, dict]:
       zero_centered=False,
   )
 
+  # Value norm has no learnable scale parameter (with_scale=False)
+  value_norm_config = cfg.NormalizationConfig(
+      type=cfg.NormalizationType.RMS_NORM,
+      epsilon=1e-6,
+      zero_centered=False,
+      with_scale=False,
+  )
+
   ff_config = cfg.FeedForwardConfig(
       type=cfg.FeedForwardType.GATED,
       activation=cfg.ActivationConfig(cfg.ActivationType.GELU_TANH),
@@ -870,6 +991,7 @@ def get_model_config_e4b() -> Tuple[cfg.ModelConfig, dict]:
         qkv_transpose_before_split=True,
         query_norm_config=norm_config,
         key_norm_config=norm_config,
+        value_norm_config=value_norm_config,
         logit_softcap=None,
         sliding_window_size=512,
         attn_type=(
