@@ -62,6 +62,15 @@ class AttentionType(enum.Enum):
 
 
 @dataclasses.dataclass
+class AltUpConfig:
+  """AltUp parameters."""
+  num_inputs: int
+  active_idx: int
+  coef_clip: float
+  correct_scale: bool
+
+
+@dataclasses.dataclass
 class NormalizationConfig:
   """Normalizater parameters."""
 
@@ -205,6 +214,10 @@ class TransformerBlockConfig:
   # KV Cache length for this block. Only used when attention types are different
   # across blocks
   kv_cache_max_len: Optional[int] = None
+  # Laurel rank for the Laurel block.
+  laurel_rank: Optional[int] = None
+  # AltUp configuration.
+  altup_config: Optional[AltUpConfig] = None
 
 
 @dataclasses.dataclass
@@ -252,6 +265,8 @@ class ModelConfig:
   # Whether LLM's HEAD shares the weight of the embedding.
   lm_head_share_weight_with_embedding: bool = True
   dense_intermediate_size: Optional[int] = None
+  hidden_size_per_layer_input: Optional[int] = None
+  per_layer_input_vocab_size: Optional[int] = None
 
   # Whether to turn on high-level function boundary.
   enable_hlfb: bool = True
