@@ -147,7 +147,13 @@ Internally, `build_model_e2b` performs:
 
 ### 2. Weight Loading
 
-The `load_gemma3n_weights` function handles the complete mapping from HuggingFace checkpoint format to our internal structure:
+The `load_gemma3n_weights` function handles the complete mapping from HuggingFace checkpoint format to our internal structure. It supports both direct text model and multimodal checkpoint formats:
+
+**Supported checkpoint formats:**
+- **Direct text model**: `model.embed_tokens`, `model.layers.{i}`
+- **Multimodal (HuggingFace)**: `model.language_model.embed_tokens`, `model.language_model.layers.{i}`
+
+The function auto-detects the format by checking for the presence of either prefix in the state dict.
 
 ```python
 # HuggingFace format → Our format
@@ -161,6 +167,7 @@ Key transformations:
 - **QKV fusion**: Q, K, V projections are concatenated into a single `qkv_projection`
 - **Norm naming**: `input_layernorm` → `pre_atten_norm`
 - **Laurel/AltUp**: Direct mapping with prefix change
+- **Format detection**: Automatic prefix detection (`model` vs `model.language_model`)
 
 ### 3. Conversion to TFLite
 
@@ -218,13 +225,25 @@ def forward(self, tokens, input_pos, kv_cache, mask=None, export_config=None):
     
     # 4. Build RoPE embeddings for each layer
     rope_list = [build_rope(input_pos, head_dim, rotary_base) for each layer]
-    
-    # 5. Process through transformer blocks
+
+    # 5. Process through transformer blocks with KV cache sharing
+    shared_kv_storage = {}  # Store KV cache for shared layers
     for i, block in enumerate(self.transformer_blocks):
+        # Get shared KV if this is a KV-shared layer
+        shared_kv = None
+        if i in self.kv_sharing_map:
+            source_layer = self.kv_sharing_map[i]
+            shared_kv = shared_kv_storage.get(source_layer)
+
         hidden_states, kv = block(
-            hidden_states, rope_list[i], mask_list[i], 
-            input_pos, kv_cache[i], per_layer_inputs[:,:,i,:]
+            hidden_states, rope_list[i], mask_list[i],
+            input_pos, kv_cache[i], per_layer_inputs[:,:,i,:],
+            shared_kv=shared_kv
         )
+
+        # Store KV for layers that are sources for sharing
+        if i in self.kv_source_layers:
+            shared_kv_storage[i] = kv
     
     # 6. Collapse AltUp hidden states
     hidden_states = self.collapse_hidden_states(hidden_states)
@@ -244,26 +263,31 @@ def forward(self, tokens, input_pos, kv_cache, mask=None, export_config=None):
 Each `Gemma3nDecoderBlock` performs:
 
 ```python
-def forward(self, hidden_states, rope, mask, input_pos, kv_cache, per_layer_input):
+def forward(self, hidden_states, rope, mask, input_pos, kv_cache, per_layer_input, shared_kv=None):
     # 1. AltUp predict step
     predictions = self.altup.predict(hidden_states)
     active_prediction = predictions[0]  # active_idx = 0
-    
+
     # 2. Pre-attention norm + LAuReL
     active_normed = self.pre_atten_norm(active_prediction)
     laurel_output = self.laurel(active_normed)
-    
-    # 3. Self-attention
-    attn_out, kv = self.atten_func(active_normed, rope, mask, input_pos, kv_cache)
+
+    # 3. Self-attention with optional KV cache sharing
+    # If this is a KV-shared layer, use shared KV from an earlier layer
+    effective_kv = shared_kv if (self.is_kv_shared_layer and shared_kv is not None) else kv_cache
+    attn_out, kv = self.atten_func(active_normed, rope, mask, input_pos, effective_kv)
+    # For shared layers, don't update KV cache - return original unchanged
+    if self.is_kv_shared_layer and shared_kv is not None:
+        kv = kv_cache
     attn_out = self.post_atten_norm(attn_out)
     
     # 4. Combine attention with LAuReL
     attn_gated = active_prediction + attn_out
     attn_laurel = (attn_gated + laurel_output) / sqrt(2)
-    
-    # 5. Feed-forward with pre/post norms
+
+    # 5. Feed-forward with pre/post norms and activation sparsity
     ff_input = self.pre_ff_norm(attn_laurel)
-    ff_out = self.ff(ff_input)
+    ff_out = self.ff(ff_input)  # SparseGatedMLP applies Gaussian top-k if sparsity > 0
     ff_out = self.post_ff_norm(ff_out)
     attn_ff = attn_laurel + ff_out
     
@@ -277,6 +301,68 @@ def forward(self, hidden_states, rope, mask, input_pos, kv_cache, per_layer_inpu
     corrected[1:] += per_layer_out  # Add to non-active streams
     
     return corrected, kv
+```
+
+### SparseGatedMLP with Precomputed Sparsity
+
+The `SparseGatedMLP` class implements gated MLP with optional Gaussian top-k activation sparsity. A key optimization for TFLite compatibility is the **precomputation of `std_multiplier`** during initialization:
+
+```python
+class SparseGatedMLP:
+    def __init__(self, hidden_size, intermediate_size, activation_sparsity=0.0):
+        # ...
+        # Precompute std_multiplier to avoid erfinv at runtime (not supported by TFLite)
+        if self.activation_sparsity > 0.0:
+            normal_dist = torch.distributions.normal.Normal(0, 1)
+            std_mult_value = float(normal_dist.icdf(torch.tensor(self.activation_sparsity)))
+            self.register_buffer("std_multiplier", torch.tensor(std_mult_value), persistent=False)
+
+    def _gaussian_topk(self, inputs):
+        # Threshold: mean + std * icdf(sparsity) - where icdf is precomputed
+        inputs_mean = torch.mean(inputs, dim=-1, keepdim=True)
+        inputs_std = torch.std(inputs, dim=-1, keepdim=True, unbiased=False)
+        cutoff = inputs_mean + inputs_std * self.std_multiplier.to(inputs.dtype)
+        return F.relu(inputs - cutoff)
+```
+
+**Why precompute?**
+- The inverse CDF computation (`icdf`/`erfinv`) is not supported by TFLite's operation set
+- By computing this value once during model initialization and storing it as a buffer, we avoid runtime errors during conversion
+- For 95% sparsity (used in first 10 layers), `std_multiplier ≈ 1.6449`
+
+**Sparsity pattern in Gemma3n:**
+- First 10 layers: 95% activation sparsity (only top 5% of activations pass through)
+- Remaining layers: Dense (0% sparsity)
+
+### KV Cache Sharing
+
+The decoder implements KV cache sharing between layers to reduce memory footprint:
+
+**Layer types:**
+- **Global layers**: Every 5th layer (layers 4, 9, 14, etc.) - uses full attention
+- **Sliding window layers**: All other layers - uses local attention with window_size=512
+
+**Sharing mechanism:**
+- Later layers (controlled by `num_kv_shared_layers`) reuse KV cache from earlier layers of the same type
+- A `kv_sharing_map` dict maps shared layer indices to their source layer: `{28: 8, 29: 9}` means layer 28 shares KV from layer 8
+- Source layers store their KV cache in `shared_kv_storage` for reuse
+- Shared layers receive `shared_kv` parameter and don't update the KV cache
+
+```python
+# In Decoder.forward():
+for i, block in enumerate(self.transformer_blocks):
+    # Get shared KV if this is a shared layer
+    shared_kv = None
+    if i in self.kv_sharing_map:
+        source_layer = self.kv_sharing_map[i]
+        shared_kv = shared_kv_storage.get(source_layer)
+
+    # Process block with optional shared KV
+    hidden_states, kv_entry = block(..., shared_kv=shared_kv)
+
+    # Store KV for layers that are sources for sharing
+    if i in self.kv_source_layers:
+        shared_kv_storage[i] = kv_entry
 ```
 
 ---
